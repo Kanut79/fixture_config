@@ -34,6 +34,8 @@ The fixture data is not in this repo. Known data location: `C:\DEV\Test\New fold
 ## Output
 
 - `output/<Name>.json`, `<Name>` = folder name without the `NN_` prefix, spaces → `_` (`Stellantis_Small`).
+  For folders not named `NN_<Name>`, pass `--name`. The default output folder is `<folder>/../../output`
+  (layout `input/<folder>` next to `output/`); for any other layout, pass `--out-dir`.
 - `output/resources/<Name>.jpg` (or `.png`): the resource image. Existing resource images are used as they are.
   If missing, the generator creates it: `Nutzen_CNT.jpg`, optionally downscaled (`--scale`), plus a black
   5 px frame 12 px inside the image border. (VCC: CNT 16458x7785 was downscaled by 1/3.125 to 5267x2491.
@@ -136,6 +138,9 @@ Dark threshold for lines: gray < 160 (JPEG anti-aliasing).
 4. Look at the preview `preview/<Name>.png` (blue = ShapeModel, red = NestShape, green = MCUs; points
    drawn as dots). The red outline must lie on the PCB contour and green boxes where the colored chips are in the PDF.
 5. Ask the user about anything not covered by the rules above (MCU names without a legend, nest including the connector, slots).
+6. After runs or question rounds that produced new findings (rules, user decisions, new input
+   variants, pitfalls, reference values), always ask the user whether to add them to this CLAUDE.md.
+   Show the proposed text and add it only after the user agrees.
 
 ## Reference values (regression)
 
@@ -143,6 +148,10 @@ Dark threshold for lines: gray < 160 (JPEG anti-aliasing).
 |---|---|---|---|---|---|---|
 | Stellantis Small | 19 | 7016x4728 | 20.6891 | (109.7, 41.3) | 21 | MCU_U800 1080x1080 at (5250, 490), 1/0/0 |
 | VCC SPA1 Volvo ECU | 20 | 5267x2491 | 10.2397 | (51.0, 88.1) | 47 | MCU_XTDA 330x650 at (3520, 760) 1/0/0 and (3850, 760) 1/1/1; UART point (1778, 735) 1/1/0; MCU_W35N 230x180 at (4590, 1220) 2/0/0 (run with `--shape-name "IO driver=UART"`) |
+
+VCC from `C:\DEV\Test\New folder (2)` (same input files, no resource image, `--scale 1.0`): image
+16458x7785 created, scale 31.9924 px/pt, offset (161.6, 277.8), 78 nest points, XTDA at (10990, 2360) /
+(12020, 2360), UART (5558, 2299), W35N (14350, 3810), i.e. the 0.32 values / 0.32 within a few px.
 
 `output/Stellantis_Small.json` was produced by this generator and must stay byte-identical when
 regenerated from the same input and resource image.

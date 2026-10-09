@@ -22,6 +22,7 @@ How it works:
 Usage:
   python fixture_gen.py "<data>/input/03_Stellantis Small"
   python fixture_gen.py "<data>/input/05_VCC SPA1 Volvo ECU" --shape-name "IO driver=UART" --out-dir C:/temp/check
+  python fixture_gen.py "C:/data/any folder" --name VCC_SPA1_Volvo_ECU --out-dir "C:/data/any folder/output"
 """
 import argparse
 import json
@@ -379,6 +380,7 @@ def draw_preview(image_path, doc, path):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("folder", type=Path, help="fixture input folder")
+    parser.add_argument("--name", default=None, help="output name, default: folder name without 'NN_' prefix")
     parser.add_argument("--out-dir", type=Path, default=None, help="default: <folder>/../../output")
     parser.add_argument("--force", action="store_true", help="overwrite an existing JSON")
     parser.add_argument("--scale", type=float, default=1.0, help="scale for a newly created resource image")
@@ -396,7 +398,7 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv)
     folder = args.folder.resolve()
-    name = fixture_name(folder)
+    name = args.name or fixture_name(folder)
     out_dir = (args.out_dir or folder.parent.parent / "output").resolve()
     json_path = out_dir / f"{name}.json"
     if json_path.exists() and not args.force:
