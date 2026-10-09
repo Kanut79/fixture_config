@@ -1,13 +1,14 @@
 """Generate a fixture config JSON from a fixture input folder.
 
 Input folder (e.g. input/03_Stellantis Small):
-  FX ID<n>.txt          fixture ID in the file name
+  FX ID<n>.txt          fixture ID in the file name (else --fixture-id)
   Nutzen_CNT.jpg        contour image, source of the resource image
   MCU_Pos[_ADJUSTED].pdf  PCB drawing, MCUs filled in color, optional legend "PROG1A / 1B1 XTDA"
+                        or "P1A TC37x" (else --pdf <other PDF>)
 
 Output:
   <out-dir>/<Name>.json            fixture config
-  <out-dir>/resources/<Name>.jpg   resource image (only created if missing: CNT image plus frame)
+  <out-dir>/resources/<Name>.jpg   resource image (only created if missing: CNT image, 40 px white margin, frame)
   preview/<Name>.png               overlay of all shapes on the image, for a visual check
 
 How it works:
@@ -20,9 +21,9 @@ How it works:
     image position of the shape's first coordinate.
 
 Usage:
-  python fixture_gen.py "<data>/input/03_Stellantis Small"
-  python fixture_gen.py "<data>/input/05_VCC SPA1 Volvo ECU" --shape-name "IO driver=UART" --out-dir C:/temp/check
-  python fixture_gen.py "C:/data/any folder" --name VCC_SPA1_Volvo_ECU --out-dir "C:/data/any folder/output"
+  python fixture_gen.py "<data>/input/03_Stellantis Small" --name Stellantis_Small
+  python fixture_gen.py "<data>/input/05_VCC SPA1 Volvo ECU" --name VCC_SPA1_Volvo_ECU --shape-name "IO driver=UART" --out-dir C:/temp/check
+  python fixture_gen.py "C:/data/Nutzen" --name Renault_P10_Main_Master --fixture-id 33 --pdf bad4200_01_ASSEMBLY_BOT_ETL000_B.pdf --out-dir C:/data/output
 """
 import argparse
 import json
@@ -37,34 +38,38 @@ import pymupdf
 DARK_THRESHOLD = 160
 MCU_GRID = 10
 BORDER_THICKNESS = 3
+FRAME_MARGIN = 40
 STRIKE_COLOR_MIN_RED = 0.8
-PROGRAMMER_TOKEN = re.compile(r"^(?:PROG)?(\d+)([AB])(\d?)$", re.IGNORECASE)
+PROGRAMMER_TOKEN = re.compile(r"^(?:PROG|P)?(\d+)([AB])(\d?)$", re.IGNORECASE)
 REFERENCE_DESIGNATOR = re.compile(r"^[A-Z]{1,2}\d+$")
 
 
 # ---------- input folder ----------
 
-def fixture_name(folder):
-    """'03_Stellantis Small' -> 'Stellantis_Small'."""
-    return re.sub(r"^\d+_", "", folder.name).strip().replace(" ", "_")
-
-
-def fixture_id(folder):
+def fixture_id(folder, given):
+    if given is not None:
+        return given
     for path in folder.glob("FX ID*.txt"):
         match = re.search(r"FX ID\s*(\d+)", path.name)
         if match:
             return int(match.group(1))
-    raise SystemExit(f"No 'FX ID<n>.txt' in {folder}")
+    raise SystemExit(f"No 'FX ID<n>.txt' in {folder}. Pass the fixture ID with --fixture-id.")
 
 
-def mcu_pdf(folder):
+def mcu_pdf(folder, given):
+    if given is not None:
+        path = given if given.is_absolute() else folder / given
+        if not path.exists():
+            raise SystemExit(f"PDF not found: {path}")
+        return path
     adjusted = sorted(folder.glob("MCU_Pos*ADJUSTED*.pdf"))
     if adjusted:
         return adjusted[0]
     plain = folder / "MCU_Pos.pdf"
     if plain.exists():
         return plain
-    raise SystemExit(f"No MCU_Pos.pdf in {folder}")
+    others = ", ".join(p.name for p in sorted(folder.glob("*.pdf"))) or "none"
+    raise SystemExit(f"No MCU_Pos.pdf in {folder} (other PDFs: {others}). Pass one with --pdf.")
 
 
 # ---------- resource image ----------
@@ -80,6 +85,9 @@ def resource_image(folder, out_dir, name, scale):
         raise SystemExit(f"No Nutzen_CNT.jpg in {folder}")
     if scale != 1.0:
         image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    # White margin first, so the frame never covers a board edge that touches the CNT image border.
+    image = cv2.copyMakeBorder(image, FRAME_MARGIN, FRAME_MARGIN, FRAME_MARGIN, FRAME_MARGIN,
+                               cv2.BORDER_CONSTANT, value=(255, 255, 255))
     h, w = image.shape[:2]
     cv2.rectangle(image, (12, 12), (w - 13, h - 13), (0, 0, 0), 5)
     resources.mkdir(parents=True, exist_ok=True)
@@ -380,7 +388,10 @@ def draw_preview(image_path, doc, path):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("folder", type=Path, help="fixture input folder")
-    parser.add_argument("--name", default=None, help="output name, default: folder name without 'NN_' prefix")
+    parser.add_argument("--name", required=True, help="output name, e.g. Stellantis_Small (ask the user)")
+    parser.add_argument("--fixture-id", type=int, default=None, help="fixture ID if there is no 'FX ID<n>.txt'")
+    parser.add_argument("--pdf", type=Path, default=None,
+                        help="MCU position PDF if there is no MCU_Pos.pdf (relative to the folder or absolute)")
     parser.add_argument("--out-dir", type=Path, default=None, help="default: <folder>/../../output")
     parser.add_argument("--force", action="store_true", help="overwrite an existing JSON")
     parser.add_argument("--scale", type=float, default=1.0, help="scale for a newly created resource image")
@@ -398,11 +409,13 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv)
     folder = args.folder.resolve()
-    name = args.name or fixture_name(folder)
+    name = args.name
     out_dir = (args.out_dir or folder.parent.parent / "output").resolve()
     json_path = out_dir / f"{name}.json"
     if json_path.exists() and not args.force:
         raise SystemExit(f"{json_path} exists. Use --force to overwrite or --out-dir for another folder.")
+    fixture = fixture_id(folder, args.fixture_id)
+    pdf_path = mcu_pdf(folder, args.pdf)
 
     image_path, created = resource_image(folder, out_dir, name, args.scale)
     gray = read_gray(image_path)
@@ -410,7 +423,6 @@ def main(argv=None):
     frame = detect_frame(gray)
     origin = (gray.shape[1] // 2, gray.shape[0] // 2)
 
-    pdf_path = mcu_pdf(folder)
     board, chips, legends, words = read_pdf(pdf_path)
     points = outline_points(board)
     origin_pdf = np.concatenate(segments(board)).min(axis=0)
@@ -432,7 +444,7 @@ def main(argv=None):
         return [(x - origin[0], y - origin[1]) for x, y in poly]
 
     doc = {
-        "fixtureId": fixture_id(folder),
+        "fixtureId": fixture,
         "image": f"fixtures/resources/{image_path.name}",
         "imagetype": "gray",
         "shape": placement("ShapeModel", *frame_poly[0]),

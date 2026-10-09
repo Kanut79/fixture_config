@@ -25,20 +25,26 @@ The fixture data is not in this repo. Known data location: `C:\DEV\Test\New fold
 
 | File | Content |
 |---|---|
-| `FX ID<n>.txt` | Empty. The fixture ID is the number in the file name. |
+| `FX ID<n>.txt` | Empty. The fixture ID is the number in the file name. If the folder has no fixture ID (e.g. only `No FX ID.txt`), always ask the user for it and pass it with `--fixture-id`. |
 | `Nutzen_CNT.jpg` | Contour line drawing (gray/black lines on white) of the PCB in its nest, with labels PCB1, PROGxx, B5/B7, DMC. Same orientation as the PDF (not mirrored). |
 | `MCU_Pos.pdf` | Valeo PCB assembly drawing (vector). MCUs are filled boxes in color (yellow, green, purple ...). Optional legend right of the board: colored box + text like `PROG2A W35N`, `PROG1A / 1B1 XTDA`. |
 | `MCU_Pos_ADJUSTED.pdf` | Optional. Corrected version of MCU_Pos.pdf and wins over it. Corrections are red strike-throughs of legend text, new legend text, and red callout notes (e.g. "hier nur punkt (IO driver), kein rechteck" = the IO driver is a point, not a rectangle). |
 | `Nutzen.pdf` | Optional outline drawing (PCB + connector). Not used. |
+| other PDF | Seen: `bad4200_01_ASSEMBLY_BOT_ETL000_B.pdf` (folder `Nutzen`, no MCU_Pos.pdf). Valeo bottom-side assembly drawing with the same colored MCU boxes and a legend in short form `P1A TC37x`, `P1B W25N01`. It had the same orientation as the CNT image (not mirrored). Check the holes every time anyway. |
+
+If the folder has no `MCU_Pos.pdf` (or `MCU_Pos*ADJUSTED*.pdf`), always ask the user whether one of the
+other PDFs in the folder should be used instead. List them in the question. Never pick one yourself.
+Pass the chosen PDF with `--pdf`.
 
 ## Output
 
-- `output/<Name>.json`, `<Name>` = folder name without the `NN_` prefix, spaces → `_` (`Stellantis_Small`).
-  For folders not named `NN_<Name>`, pass `--name`. The default output folder is `<folder>/../../output`
+- `output/<Name>.json`. Always ask the user for `<Name>` and pass it with `--name`. Never derive it from
+  the folder name. (Existing names: `Stellantis_Small`, `VCC_SPA1_Volvo_ECU`.) The default output folder is `<folder>/../../output`
   (layout `input/<folder>` next to `output/`); for any other layout, pass `--out-dir`.
 - `output/resources/<Name>.jpg` (or `.png`): the resource image. Existing resource images are used as they are.
-  If missing, the generator creates it: `Nutzen_CNT.jpg`, optionally downscaled (`--scale`), plus a black
-  5 px frame 12 px inside the image border. (VCC: CNT 16458x7785 was downscaled by 1/3.125 to 5267x2491.
+  If missing, the generator creates it: `Nutzen_CNT.jpg`, optionally downscaled (`--scale`), a 40 px white
+  margin around it (the board can touch the CNT image border, e.g. Nutzen), and a black 5 px frame 12 px
+  inside the new image border. (VCC: CNT 16458x7785 was downscaled by 1/3.125 to 5267x2491.
   Stellantis: same size 7016x4728. Both got a hand-drawn black frame.)
 
 ### JSON format
@@ -106,7 +112,7 @@ coordinates, `0.0` for `shapeXCoordinate`/`shapeYCoordinate`, `null` for `backgr
 | MCU box | Filled colored (non-gray) box inside the PDF board outline. Colored boxes outside the board are legend boxes. |
 | MCU name | Legend text minus the programmer tokens (`XTDA`, `W35N`, `IO driver`). Without a legend: the reference designator inside the box (`U800`). |
 | `shapeId` | `MCU_<name>` with spaces → `_`, unless overridden (`--shape-name "IO driver=UART"`; VCC used `UART`). |
-| Programmer | Token `PROG<id><A/B><slot?>` or short `<id><A/B><slot?>` after a `/`: `programmerId` = id, `channel` A=0 / B=1, `slot` = the digit, 0 if missing (user decision 2026-10-09). `PROG1A / 1B1 XTDA` = one chip on two programmer channels. |
+| Programmer | Token `PROG<id><A/B><slot?>`, `P<id><A/B><slot?>` (e.g. `P1A TC37x`) or short `<id><A/B><slot?>` after a `/`: `programmerId` = id, `channel` A=0 / B=1, `slot` = the digit, 0 if missing (user decision 2026-10-09). `PROG1A / 1B1 XTDA` = one chip on two programmer channels. |
 | Several programmers on one chip | Box split horizontally into equal parts, left part = first token. |
 | No legend | Programmer 1, channel 0, slot 0 (PROG1A), next chips 2A, 3A ... The generator prints a warning. Check the PROGxx labels in `Nutzen_CNT.jpg`. |
 | Point instead of rectangle | Legend names in `--point-name` (default `IO driver`). |
@@ -133,7 +139,7 @@ Dark threshold for lines: gray < 160 (JPEG anti-aliasing).
    outline with plausible aspect ratio, one colored box per MCU, legend parsed correctly.
 2. Read the PDF and `Nutzen_CNT.jpg` yourself (Read tool) for notes and callouts the parser doesn't
    understand (points instead of rectangles, renamed MCUs, changed programmer channels).
-3. `python fixture_gen.py "<input folder>" [--shape-name "NAME=ID"] [--point-name "NAME"] [--scale 0.32]`.
+3. `python fixture_gen.py "<input folder>" --name <Name from the user> [--fixture-id <n>] [--pdf <file>] [--shape-name "NAME=ID"] [--point-name "NAME"] [--scale 0.32]`.
    It refuses to overwrite an existing JSON; use `--force` only with the user's OK, or `--out-dir` to test.
 4. Look at the preview `preview/<Name>.png` (blue = ShapeModel, red = NestShape, green = MCUs; points
    drawn as dots). The red outline must lie on the PCB contour and green boxes where the colored chips are in the PDF.
@@ -148,10 +154,15 @@ Dark threshold for lines: gray < 160 (JPEG anti-aliasing).
 |---|---|---|---|---|---|---|
 | Stellantis Small | 19 | 7016x4728 | 20.6891 | (109.7, 41.3) | 21 | MCU_U800 1080x1080 at (5250, 490), 1/0/0 |
 | VCC SPA1 Volvo ECU | 20 | 5267x2491 | 10.2397 | (51.0, 88.1) | 47 | MCU_XTDA 330x650 at (3520, 760) 1/0/0 and (3850, 760) 1/1/1; UART point (1778, 735) 1/1/0; MCU_W35N 230x180 at (4590, 1220) 2/0/0 (run with `--shape-name "IO driver=UART"`) |
+| Renault P10 Main Master | 33 (from the user, no FX ID file) | 2410x1519 (created: CNT 2330x1439 + 40 px margin) | 7.9959 | (69.5, 52.9) | 46 | MCU_TC37x 380x380 at (1080, 470) 1/0/0; MCU_W25N01 180x140 at (730, 690) 1/1/0 |
+
+The Renault run: `C:\DEV\Test\New folder (2)\Nutzen`, `--name Renault_P10_Main_Master --fixture-id 33
+--pdf bad4200_01_ASSEMBLY_BOT_ETL000_B.pdf --out-dir output`.
 
 VCC from `C:\DEV\Test\New folder (2)` (same input files, no resource image, `--scale 1.0`): image
 16458x7785 created, scale 31.9924 px/pt, offset (161.6, 277.8), 78 nest points, XTDA at (10990, 2360) /
 (12020, 2360), UART (5558, 2299), W35N (14350, 3810), i.e. the 0.32 values / 0.32 within a few px.
+This was created before the 40 px margin existed. Regenerating it now gives a 16538x7865 image and all values +40.
 
 `output/Stellantis_Small.json` was produced by this generator and must stay byte-identical when
 regenerated from the same input and resource image.
@@ -171,5 +182,7 @@ an unused `PMIC` shape and a different `mcuId` order. Don't use it as the refere
 - Windows PowerShell 5.1 turns native stderr (pip notices) into errors under `$ErrorActionPreference = "Stop"`.
 - A missing resource image is created silently. When testing with `--out-dir`, copy `output/resources/` there
   first, otherwise the fit is done on a newly created image and differs slightly.
+- Watermark text in the PDFs (e.g. yellow "Prototype Released" over the board) is not picked up as an MCU box.
+  Only filled colored boxes count.
 - Not every fixture's drawing must be in the same orientation as the CNT image. Check a mounting hole
   in the PDF against the CNT image. The generator doesn't handle mirrored or rotated drawings.
