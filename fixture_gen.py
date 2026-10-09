@@ -12,7 +12,7 @@ Output:
   preview/<Name>.png               overlay of all shapes on the image, for a visual check
 
 How it works:
-  - ShapeModel = black frame of the resource image.
+  - ShapeModel = black frame of the resource image, or the outer contour of the drawing if it has no frame.
   - The board outline path and the colored MCU boxes are read as vectors from the PDF.
   - Scale and offset PDF -> image are fitted by matching the PDF board outline to the image contour.
   - NestShape = PDF board outline in image pixels. MCUs = colored boxes, split horizontally when one
@@ -39,6 +39,7 @@ DARK_THRESHOLD = 160
 MCU_GRID = 10
 BORDER_THICKNESS = 3
 FRAME_MARGIN = 40
+FRAME_MIN_COVERAGE = 0.98
 STRIKE_COLOR_MIN_RED = 0.8
 PROGRAMMER_TOKEN = re.compile(r"^(?:PROG|P)?(\d+)([AB])(\d?)$", re.IGNORECASE)
 REFERENCE_DESIGNATOR = re.compile(r"^[A-Z]{1,2}\d+$")
@@ -108,13 +109,46 @@ def dark_run_centres(line):
 
 
 def detect_frame(gray):
-    """Centre line of the outer black frame: (left, top, right, bottom)."""
+    """Centre line of the outer black frame (left, top, right, bottom), or None if there is no frame.
+
+    A frame counts only if all four sides are continuous dark lines between the corners.
+    Without this check the outermost lines of the drawing itself would be taken as the frame."""
     h, w = gray.shape
     row = dark_run_centres(gray[h // 2, :])
     col = dark_run_centres(gray[:, w // 2])
     if len(row) < 2 or len(col) < 2:
-        raise SystemExit("Frame not found in resource image")
-    return round(row[0]), round(col[0]), round(row[-1]), round(col[-1])
+        return None
+    left, top, right, bottom = round(row[0]), round(col[0]), round(row[-1]), round(col[-1])
+    dark = gray < DARK_THRESHOLD
+
+    def covered(band):
+        return band.any(axis=0 if band.shape[0] <= band.shape[1] else 1).mean() >= FRAME_MIN_COVERAGE
+
+    sides = (dark[top - 3:top + 4, left:right + 1], dark[bottom - 3:bottom + 4, left:right + 1],
+             dark[top:bottom + 1, left - 3:left + 4], dark[top:bottom + 1, right - 3:right + 4])
+    if min(left, top) < 3 or right + 4 > w or bottom + 4 > h or not all(covered(s) for s in sides):
+        return None
+    return left, top, right, bottom
+
+
+def frame_polygon(gray, lines, warnings):
+    """ShapeModel polygon: the black frame, or the outer contour of the drawing if there is no frame."""
+    frame = detect_frame(gray)
+    if frame is not None:
+        left, top, right, bottom = frame
+        return [(left, top), (left, bottom), (right, bottom), (right, top), (left, top)]
+    warnings.append("No frame in the resource image, ShapeModel created from the outer contour of the drawing")
+    mask = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        raise SystemExit("Resource image is empty: no frame and no drawing found")
+    contour = max(contours, key=cv2.contourArea)
+    return start_down_left_side(cv2.approxPolyDP(contour, 2.0, True)[:, 0, :].tolist())
+
+
+def bounding_box(poly):
+    xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+    return min(xs), min(ys), max(xs), max(ys)
 
 
 # ---------- PDF vectors ----------
@@ -420,24 +454,22 @@ def main(argv=None):
     image_path, created = resource_image(folder, out_dir, name, args.scale)
     gray = read_gray(image_path)
     lines = (gray < DARK_THRESHOLD).astype(np.uint8)
-    frame = detect_frame(gray)
     origin = (gray.shape[1] // 2, gray.shape[0] // 2)
+    warnings = []
+    frame_poly = frame_polygon(gray, lines, warnings)
 
     board, chips, legends, words = read_pdf(pdf_path)
     points = outline_points(board)
     origin_pdf = np.concatenate(segments(board)).min(axis=0)
-    scale, offset = coarse_fit(lines, points, frame)
+    scale, offset = coarse_fit(lines, points, bounding_box(frame_poly))
     scale, offset, error = refine_fit(lines, points, scale, offset)
 
     def to_image(pt):
         return tuple((np.array(pt) - origin_pdf) * scale + offset)
 
-    warnings = []
     if error > 3.0:
         warnings.append(f"Board outline fits the image poorly (mean distance {error:.1f} px), check the preview")
     nest = nest_polygon(board, origin_pdf, scale, offset, gray.shape)
-    frame_poly = [(frame[0], frame[1]), (frame[0], frame[3]), (frame[2], frame[3]), (frame[2], frame[1]),
-                  (frame[0], frame[1])]
     mcu_shapes, mcus = build_mcus(chips, legends, words, to_image, origin, args, warnings)
 
     def relative(poly):

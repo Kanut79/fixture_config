@@ -85,7 +85,7 @@ coordinates, `0.0` for `shapeXCoordinate`/`shapeYCoordinate`, `null` for `backgr
 | `fixtureId` | Number from `FX ID<n>.txt` |
 | `image` | Always `fixtures/resources/<resource file name>` |
 | `imagetype` | Always `"gray"` |
-| `shape` | Placement of `ShapeModel` (the fixture frame) |
+| `shape` | Placement of `ShapeModel` (the fixture frame / panel outline) |
 | `shapes[]` | Shape definitions, each `shapeId` once. Shapes are reused by several placements (e.g. both halves of a dual-programmer MCU). |
 | `borderThickness` | Always 3 |
 | `nests[]` | One nest per PCB. All seen fixtures have one nest, `nestId` 1. |
@@ -107,7 +107,7 @@ coordinates, `0.0` for `shapeXCoordinate`/`shapeYCoordinate`, `null` for `backgr
 
 | Element | Rule |
 |---|---|
-| `ShapeModel` | Centre line of the black frame of the resource image. Order TL → BL → BR → TR → TL. |
+| `ShapeModel` | Centre line of the black frame of the resource image. Order TL → BL → BR → TR → TL. A frame counts only if all four sides are continuous dark lines (≥ 98% coverage). If no frame (panel outline) is found, create one: the outer contour of the drawing in the resource image, simplified with 2 px tolerance, starting at the top of the left edge like the NestShape. The generator does this automatically and prints a warning; tell the user. |
 | `NestShape` | PCB outline only (board path from the PDF, mapped to image pixels), **not** the connector housing. Starts at the top of the left edge and runs down the left side (counter-clockwise on screen). Simplified with 2 px tolerance. |
 | MCU box | Filled colored (non-gray) box inside the PDF board outline. Colored boxes outside the board are legend boxes. |
 | MCU name | Legend text minus the programmer tokens (`XTDA`, `W35N`, `IO driver`). Without a legend: the reference designator inside the box (`U800`). |
@@ -158,6 +158,10 @@ Dark threshold for lines: gray < 160 (JPEG anti-aliasing).
 
 The Renault run: `C:\DEV\Test\New folder (2)\Nutzen`, `--name Renault_P10_Main_Master --fixture-id 33
 --pdf bad4200_01_ASSEMBLY_BOT_ETL000_B.pdf --out-dir output`.
+
+No-frame test (same call, `Nutzen_CNT.jpg` used directly as resource image, so no frame): ShapeModel from
+the outer contour, 46 points, placed at (28, 51); fit 7.9956 px/pt, offset (29.6, 13.0);
+MCU_TC37x at (1040, 430), MCU_W25N01 at (690, 650).
 
 VCC from `C:\DEV\Test\New folder (2)` (same input files, no resource image, `--scale 1.0`): image
 16458x7785 created, scale 31.9924 px/pt, offset (161.6, 277.8), 78 nest points, XTDA at (10990, 2360) /
