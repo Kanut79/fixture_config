@@ -1,10 +1,10 @@
 """Generate a fixture config JSON from a fixture input folder.
 
-Input folder (e.g. input/03_Stellantis Small):
+Input folder:
   FX ID<n>.txt          fixture ID in the file name (else --fixture-id)
   Nutzen_CNT.jpg        contour image, source of the resource image
-  MCU_Pos[_ADJUSTED].pdf  PCB drawing, MCUs filled in color, optional legend "PROG1A / 1B1 XTDA"
-                        or "P1A TC37x" (else --pdf <other PDF>)
+  MCU_Pos[_ADJUSTED].pdf  PCB drawing, MCUs filled in color, optional legend "PROG1A / 1B1 <type>"
+                        or "P1A <type>" (else --pdf <other PDF>)
 
 Output:
   <out-dir>/<Name>.json            fixture config
@@ -21,11 +21,12 @@ How it works:
     image position of the shape's first coordinate.
 
 Usage:
-  python fixture_gen.py "<data>/input/03_Stellantis Small" --name Stellantis_Small
-  python fixture_gen.py "<data>/input/05_VCC SPA1 Volvo ECU" --name VCC_SPA1_Volvo_ECU --shape-name "IO driver=UART" --out-dir C:/temp/check
-  python fixture_gen.py "C:/data/Nutzen" --name Renault_P10_Main_Master --fixture-id 33 --pdf bad4200_01_ASSEMBLY_BOT_ETL000_B.pdf --out-dir C:/data/output
+  python fixture_gen.py "<data>/input/<NN>_<Folder>" --name <Name>
+  python fixture_gen.py "<input folder>" --name <Name> --shape-name "IO driver=UART" --out-dir <temp dir>
+  python fixture_gen.py "<input folder>" --name <Name> --fixture-id <n> --pdf <other PDF> --out-dir <output dir>
 """
 import argparse
+import colorsys
 import json
 import re
 import sys
@@ -51,6 +52,8 @@ def fixture_id(folder, given):
     if given is not None:
         return given
     for path in folder.glob("FX ID*.txt"):
+        if re.search(r"FX ID\s*\d+\s*-\s*\d+", path.name):
+            raise SystemExit(f"'{path.name}' is an ID range. Ask which ID to use and pass it with --fixture-id.")
         match = re.search(r"FX ID\s*(\d+)", path.name)
         if match:
             return int(match.group(1))
@@ -222,7 +225,7 @@ def legend_text(box, words, struck):
 
 
 def parse_legend(text):
-    """'PROG1A / 1B1 XTDA' -> ([(1, 0, 0), (1, 1, 1)], 'XTDA')."""
+    """'PROG1A / 1B1 ABC1' -> ([(1, 0, 0), (1, 1, 1)], 'ABC1')."""
     programmers, name = [], []
     for token in text.replace("/", " ").split():
         match = PROGRAMMER_TOKEN.match(token)
@@ -252,7 +255,30 @@ def read_pdf(path):
             chips.append((color, rect))
         else:
             legends[color] = legend_text(rect, words, struck)
-    return board, chips, legends, words
+    notes = match_legends_by_hue(chips, legends)
+    return board, chips, legends, words, notes
+
+
+def hue_distance(a, b):
+    """Distance on the hue circle, 0..0.5."""
+    d = abs(colorsys.rgb_to_hsv(*a)[0] - colorsys.rgb_to_hsv(*b)[0])
+    return min(d, 1 - d)
+
+
+def match_legends_by_hue(chips, legends):
+    """Give each chip without an exactly matching legend color the unused legend with the nearest hue.
+
+    The legend is re-keyed to the chip color. Seen: chip turquoise (0.25, 0.88, 0.82), legend light cyan
+    (0.75, 1, 1). Returns notes for the user."""
+    notes = []
+    for color, _ in chips:
+        unused = [c for c in legends if c not in {chip for chip, _ in chips} and legends[c]]
+        if color in legends or not unused:
+            continue
+        nearest = min(unused, key=lambda c: hue_distance(c, color))
+        legends[color] = legends.pop(nearest)
+        notes.append(f"MCU color {color} has no exact legend, matched by hue to '{legends[color]}' {nearest}")
+    return notes
 
 
 # ---------- PDF -> image transform ----------
@@ -333,7 +359,7 @@ def nest_polygon(board, origin_pdf, scale, offset, image_shape):
 
 
 def start_down_left_side(poly):
-    """Start at the top of the left edge and run down the left side, like the VCC example."""
+    """Start at the top of the left edge and run down the left side, like the hand-made configs."""
     min_x = min(p[0] for p in poly)
     start = min((i for i, p in enumerate(poly) if p[0] <= min_x + 2), key=lambda i: poly[i][1])
     poly = poly[start:] + poly[:start]
@@ -422,7 +448,7 @@ def draw_preview(image_path, doc, path):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("folder", type=Path, help="fixture input folder")
-    parser.add_argument("--name", required=True, help="output name, e.g. Stellantis_Small (ask the user)")
+    parser.add_argument("--name", required=True, help="output name (ask the user)")
     parser.add_argument("--fixture-id", type=int, default=None, help="fixture ID if there is no 'FX ID<n>.txt'")
     parser.add_argument("--pdf", type=Path, default=None,
                         help="MCU position PDF if there is no MCU_Pos.pdf (relative to the folder or absolute)")
@@ -458,7 +484,8 @@ def main(argv=None):
     warnings = []
     frame_poly = frame_polygon(gray, lines, warnings)
 
-    board, chips, legends, words = read_pdf(pdf_path)
+    board, chips, legends, words, notes = read_pdf(pdf_path)
+    warnings.extend(notes)
     points = outline_points(board)
     origin_pdf = np.concatenate(segments(board)).min(axis=0)
     scale, offset = coarse_fit(lines, points, bounding_box(frame_poly))

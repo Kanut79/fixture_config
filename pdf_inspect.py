@@ -4,7 +4,7 @@ Prints the board outline path, the colored boxes (MCU chips on the board, legend
 the parsed legend lines with crossed-out words removed, and the reference designator inside each chip.
 
 Usage:
-  python pdf_inspect.py "<data>/input/05_VCC SPA1 Volvo ECU/MCU_Pos_ADJUSTED.pdf"
+  python pdf_inspect.py "<input folder>/MCU_Pos.pdf"
 """
 import sys
 from pathlib import Path
@@ -17,7 +17,7 @@ def fmt(rect):
 
 
 def inspect(path):
-    board, chips, legends, words = read_pdf(path)
+    board, chips, legends, words, notes = read_pdf(path)
     print(f"== {path}")
     print(f"Board outline: {fmt(board['rect'])}, {len(board['items'])} path items, "
           f"aspect {board['rect'].width / board['rect'].height:.3f}")
@@ -31,6 +31,8 @@ def inspect(path):
     unused = [c for c in legends if c not in {color for color, _ in chips}]
     for color in unused:
         print(f"  legend without MCU box: fill {color}: '{legends[color]}'")
+    for note in notes:
+        print(f"  NOTE: {note}")
 
 
 def main(argv):
