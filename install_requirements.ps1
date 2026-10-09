@@ -34,7 +34,19 @@ if ($LASTEXITCODE -ne 0) {
     throw "pip install failed with exit code $LASTEXITCODE."
 }
 
-& $Python -c "import numpy, cv2, pymupdf; print('OK: numpy', numpy.__version__, '| opencv', cv2.__version__, '| pymupdf', pymupdf.VersionBind)"
+# opencv-python-headless (older requirements) and opencv-python share the cv2 folder. Uninstalling
+# headless also deletes files of opencv-python, so opencv-python is reinstalled afterwards.
+& $Python -m pip show --disable-pip-version-check opencv-python-headless *> $null
+if ($LASTEXITCODE -eq 0) {
+    $opencv = (Select-String -Path $requirements -Pattern "^opencv-python==").Line
+    & $Python -m pip uninstall -y --disable-pip-version-check opencv-python-headless
+    & $Python -m pip install --user --disable-pip-version-check --force-reinstall --no-deps $opencv
+    if ($LASTEXITCODE -ne 0) {
+        throw "Reinstalling $opencv failed with exit code $LASTEXITCODE."
+    }
+}
+
+& $Python -c "import numpy, cv2, pymupdf, rapidocr_onnxruntime; print('OK: numpy', numpy.__version__, '| opencv', cv2.__version__, '| pymupdf', pymupdf.VersionBind, '| rapidocr ok')"
 if ($LASTEXITCODE -ne 0) {
     throw "Import check failed."
 }

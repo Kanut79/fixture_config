@@ -5,6 +5,8 @@ Input folder:
   Nutzen_CNT.jpg        contour image, source of the resource image
   MCU_Pos[_ADJUSTED].pdf  PCB drawing, MCUs filled in color, optional legend "PROG1A / 1B1 <type>"
                         or "P1A <type>" (else --pdf <other PDF>)
+  Nutzen.pdf            panel drawing, only used with --panel (several equal boards, labels
+                        PCB<n> and PROG<id><A|B><slot> per board in Nutzen_CNT.jpg)
 
 Output:
   <out-dir>/<Name>.json            fixture config
@@ -17,6 +19,9 @@ How it works:
   - Scale and offset PDF -> image are fitted by matching the PDF board outline to the image contour.
   - NestShape = PDF board outline in image pixels. MCUs = colored boxes, split horizontally when one
     box has several programmers ("PROG1A / 1B1"), a point instead of a rectangle for --point-name.
+  - --panel: one nest per board of Nutzen.pdf (NestShape, NestShape_180 for boards turned by 180 degrees).
+    The board is located in the MCU PDF (also mirrored or rotated) to carry the MCU box into every nest.
+    nestId and programmer come from the PCB<n> / PROG labels read by OCR inside each board.
   - Polygon coordinates are relative to the image centre. A placement (shapeXCoord/YCoord) is the
     image position of the shape's first coordinate.
 
@@ -24,12 +29,14 @@ Usage:
   python fixture_gen.py "<data>/input/<NN>_<Folder>" --name <Name>
   python fixture_gen.py "<input folder>" --name <Name> --shape-name "IO driver=UART" --out-dir <temp dir>
   python fixture_gen.py "<input folder>" --name <Name> --fixture-id <n> --pdf <other PDF> --out-dir <output dir>
+  python fixture_gen.py "<input folder>" --name <Name> --panel --out-dir <output dir>
 """
 import argparse
 import colorsys
 import json
 import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -43,7 +50,12 @@ FRAME_MARGIN = 40
 FRAME_MIN_COVERAGE = 0.98
 STRIKE_COLOR_MIN_RED = 0.8
 PROGRAMMER_TOKEN = re.compile(r"^(?:PROG|P)?(\d+)([AB])(\d?)$", re.IGNORECASE)
-REFERENCE_DESIGNATOR = re.compile(r"^[A-Z]{1,2}\d+$")
+REFERENCE_DESIGNATOR = re.compile(r"^[A-Z]{1,3}\d+$")
+PCB_LABEL = re.compile(r"^PCB(\d+)$", re.IGNORECASE)
+PDF_RENDER_DPI = 200
+OCR_SCALE = 0.5
+CHIP_OCR_DPIS = (100, 200, 300)
+MIN_BOARD_MATCH = 0.9
 
 
 # ---------- input folder ----------
@@ -415,6 +427,210 @@ def build_mcus(chips, legends, words, to_image, origin, args, warnings):
     return shapes, entries
 
 
+def build_single(pdf_path, gray, lines, frame_poly, origin, args, warnings):
+    """One nest from the board outline of the MCU PDF, MCUs and programmers from its colored boxes and legend."""
+    board, chips, legends, words, notes = read_pdf(pdf_path)
+    warnings.extend(notes)
+    points = outline_points(board)
+    origin_pdf = np.concatenate(segments(board)).min(axis=0)
+    scale, offset = coarse_fit(lines, points, bounding_box(frame_poly))
+    scale, offset, error = refine_fit(lines, points, scale, offset)
+
+    def to_image(pt):
+        return tuple((np.array(pt) - origin_pdf) * scale + offset)
+
+    if error > 3.0:
+        warnings.append(f"Board outline fits the image poorly (mean distance {error:.1f} px), check the preview")
+    nest = nest_polygon(board, origin_pdf, scale, offset, gray.shape)
+    mcu_shapes, mcus = build_mcus(chips, legends, words, to_image, origin, args, warnings)
+    shapes = [("NestShape", [(x - origin[0], y - origin[1]) for x, y in nest])] + list(mcu_shapes.items())
+    nests = [{"nestId": 1, "shape": placement("NestShape", *nest[0]), "mcus": mcus}]
+    report = [f"Fit:      scale {scale:.4f} px/pt, offset ({offset[0]:.1f}, {offset[1]:.1f}), mean error {error:.2f} px",
+              f"Nest:     {len(nest)} points, MCUs: {len(mcus)}"]
+    for mcu in mcus:
+        p = mcu["programmer"]
+        report.append(f"  MCU {mcu['mcuId']}: {mcu['shape']['shapeId']} at ({mcu['shape']['shapeXCoord']}, "
+                      f"{mcu['shape']['shapeYCoord']}) programmer {p['programmerId']}/{p['channel']}/{p['slot']}")
+    return shapes, nests, report
+
+
+# ---------- panel: several equal boards ----------
+
+def panel_drawings(path):
+    """Board outlines of a panel PDF (the largest group of equal stroked paths) and the panel outline."""
+    page = pymupdf.open(str(path))[0]
+    stroked = [d for d in page.get_drawings() if d.get("color") is not None]
+    groups = defaultdict(list)
+    for d in stroked:
+        groups[(len(d["items"]), round(d["rect"].width, 1), round(d["rect"].height, 1))].append(d)
+    repeated = [g for g in groups.values() if len(g) >= 2]
+    if not repeated:
+        raise SystemExit(f"No repeated board outline in {path.name}")
+    boards = max(repeated, key=lambda g: g[0]["rect"].width * g[0]["rect"].height)
+    outline = max(stroked, key=lambda d: d["rect"].width * d["rect"].height)
+    return boards, outline
+
+
+def centroid_offset(board):
+    r = board["rect"]
+    return np.concatenate(segments(board)).mean(axis=0) - ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+
+
+def render_gray(page):
+    pix = page.get_pixmap(dpi=PDF_RENDER_DPI, colorspace=pymupdf.csGRAY)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+
+
+def flip(points, size, factors):
+    return np.stack([points[:, i] if f > 0 else size[i] - points[:, i] for i, f in enumerate(factors)], axis=1)
+
+
+def locate_board(page, board):
+    """Find the panel board in the single-board MCU PDF, which may show it mirrored or rotated.
+
+    Returns PDF point of the MCU PDF -> board point (panel PDF units from the board's top left),
+    the variant name and the share of outline points that lie on lines."""
+    gray = render_gray(page)
+    lines = (gray < DARK_THRESHOLD).astype(np.uint8)
+    near_line = cv2.dilate(lines, np.ones((3, 3), np.uint8))
+    points = outline_points(board)
+    size = points.max(axis=0)
+    h, w = lines.shape
+    best = None
+    for name, factors in (("as drawn", (1, 1)), ("mirrored left-right", (-1, 1)),
+                          ("mirrored top-bottom", (1, -1)), ("rotated 180", (-1, -1))):
+        variant = flip(points, size, factors)
+        scale, offset = coarse_fit(lines, variant, (0, 0, w - 1, h - 1))
+        scale, offset, _ = refine_fit(lines, variant, scale, offset)
+        p = np.round(variant * scale + offset).astype(int)
+        score = near_line[p[:, 1].clip(0, h - 1), p[:, 0].clip(0, w - 1)].mean()
+        if best is None or score > best[0]:
+            best = (score, name, factors, scale, offset)
+    score, name, factors, scale, offset = best
+    k = PDF_RENDER_DPI / 72.0
+
+    def to_board(pt):
+        return flip((np.array([pt], float) * k - offset) / scale, size, factors)[0]
+
+    return to_board, name, float(score)
+
+
+def ocr_words(image, scale=OCR_SCALE):
+    """(text without spaces, centre, confidence) of each text line found by OCR, in image pixels."""
+    from rapidocr_onnxruntime import RapidOCR
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1 else image
+    result, _ = RapidOCR()(cv2.cvtColor(small, cv2.COLOR_GRAY2BGR))
+    return [(text.replace(" ", ""), np.mean(box, axis=0) / scale, conf) for box, text, conf in result or []]
+
+
+def chip_reference(page, rect, words):
+    """Reference designator inside a chip box, from the PDF text or by OCR if the text is drawn as strokes."""
+    ref = reference_inside(rect, words)
+    if ref:
+        return ref
+    # OCR reads small stroked text differently per resolution (seen: "M0D1"), keep the most confident match.
+    clip = pymupdf.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2)
+    refs = []
+    for dpi in CHIP_OCR_DPIS:
+        pix = page.get_pixmap(dpi=dpi, clip=clip, colorspace=pymupdf.csGRAY)
+        image = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+        refs += [(conf, text) for text, _, conf in ocr_words(image, 1) if REFERENCE_DESIGNATOR.match(text)]
+    return max(refs)[1] if refs else None
+
+
+def build_panel(folder, pdf_path, gray, lines, frame_bbox, origin, args, warnings):
+    """One nest per board of Nutzen.pdf, nest IDs and programmers from the PCB<n> / PROG labels of the image."""
+    panel_pdf = folder / "Nutzen.pdf"
+    if not panel_pdf.exists():
+        raise SystemExit(f"--panel needs Nutzen.pdf in {folder}")
+    boards, outline = panel_drawings(panel_pdf)
+    all_points = np.concatenate(segments(outline) + [s for b in boards for s in segments(b)])
+    origin_pdf = all_points.min(axis=0)
+    scale, offset = coarse_fit(lines, all_points - origin_pdf, frame_bbox)
+    scale, offset, error = refine_fit(lines, all_points - origin_pdf, scale, offset)
+    if error > 3.0:
+        warnings.append(f"Panel outline fits the image poorly (mean distance {error:.1f} px), check the preview")
+
+    def to_image(pt):
+        return (np.array(pt, float) - origin_pdf) * scale + offset
+
+    # NestShape = orientation of the top left board, NestShape_180 = boards turned by 180 degrees.
+    reference = min(boards, key=lambda b: (round(b["rect"].y0), round(b["rect"].x0)))
+    ref_direction = centroid_offset(reference)
+    groups = {"NestShape": [], "NestShape_180": []}
+    for b in boards:
+        groups["NestShape" if np.dot(centroid_offset(b), ref_direction) >= 0 else "NestShape_180"].append(b)
+    groups = {sid: group for sid, group in groups.items() if group}
+    nest_shapes = {sid: (nest_polygon(group[0], origin_pdf, scale, offset, gray.shape), group[0]["rect"])
+                   for sid, group in groups.items()}
+
+    page = pymupdf.open(str(pdf_path))[0]
+    to_board, variant, match = locate_board(page, reference)
+    if match < MIN_BOARD_MATCH:
+        warnings.append(f"Board found in {pdf_path.name} only {match:.0%} on its lines, check the preview")
+    size = np.array((reference["rect"].width, reference["rect"].height))
+    chips = []
+    for _, rect in colored_boxes(page.get_drawings()):
+        corners = np.array([to_board((rect.x0, rect.y0)), to_board((rect.x1, rect.y1))])
+        if (corners.min(axis=0) >= 0).all() and (corners.max(axis=0) <= size).all():
+            chips.append((rect, corners))
+    if len(chips) != 1:
+        raise SystemExit(f"--panel supports exactly one MCU box per board, found {len(chips)} in {pdf_path.name}")
+    rect, chip = chips[0]
+    name = chip_reference(page, rect, page.get_text("words")) or "1"
+    mcu_shape = args.shape_names.get(name, "MCU_" + name.replace(" ", "_"))
+    chip_w, chip_h = snap(abs(chip[1][0] - chip[0][0]) * scale), snap(abs(chip[1][1] - chip[0][1]) * scale)
+    mcu_coords = [(0, 0), (chip_w, 0), (chip_w, chip_h), (0, chip_h), (0, 0)]
+
+    labels = ocr_words(gray)
+    nests = []
+    for shape_id, group in groups.items():
+        poly, first = nest_shapes[shape_id]
+        local = chip if shape_id == "NestShape" else size - chip
+        for b in group:
+            r = b["rect"]
+            shift = np.round(np.array((r.x0 - first.x0, r.y0 - first.y0)) * scale).astype(int)
+            contour = (np.array(poly) + shift).astype(np.int32)
+            inside = [text for text, c, _ in labels
+                      if cv2.pointPolygonTest(contour, (float(c[0]), float(c[1])), False) >= 0]
+            pcb = [int(m.group(1)) for m in map(PCB_LABEL.match, inside) if m]
+            progs = [parse_legend(t)[0][0] for t in inside if PROGRAMMER_TOKEN.match(t)]
+            nest = {"nestId": pcb[0] if len(pcb) == 1 else None,
+                    "shape": placement(shape_id, *(np.array(poly[0]) + shift)), "mcus": []}
+            if len(progs) == 1:
+                p = progs[0]
+                x0, y0 = np.array([to_image((r.x0 + x, r.y0 + y)) for x, y in local]).min(axis=0)
+                nest["mcus"].append({"mcuId": 1, "shape": placement(mcu_shape, snap(x0), snap(y0)),
+                                     "programmer": {"programmerId": p[0], "channel": p[1], "slot": p[2]}})
+            else:
+                warnings.append(f"Board at PDF ({r.x0:.0f}, {r.y0:.0f}) has {len(progs)} PROG labels, no MCU added")
+            nests.append(nest)
+    next_id = max([n["nestId"] for n in nests if n["nestId"] is not None], default=0) + 1
+    for nest in nests:
+        if nest["nestId"] is None:
+            warnings.append(f"Board without a single PCB label got nestId {next_id}, check the preview")
+            nest["nestId"] = next_id
+            next_id += 1
+    ids = [n["nestId"] for n in nests]
+    if len(set(ids)) != len(ids):
+        warnings.append("Duplicate PCB labels, nest IDs are not unique")
+    nests.sort(key=lambda n: n["nestId"])
+
+    shapes = [(sid, [(x - origin[0], y - origin[1]) for x, y in poly]) for sid, (poly, _) in nest_shapes.items()]
+    shapes.append((mcu_shape, mcu_coords))
+    report = [f"Fit:      panel scale {scale:.4f} px/pt, offset ({offset[0]:.1f}, {offset[1]:.1f}), "
+              f"mean error {error:.2f} px",
+              f"Boards:   {', '.join(f'{len(g)} {sid}' for sid, g in groups.items())}; {pdf_path.name} shows the "
+              f"board {variant} ({match:.0%} on lines), MCU '{name}'",
+              f"Nests:    {len(nests)}, MCUs: {sum(len(n['mcus']) for n in nests)}"]
+    for n in nests:
+        for m in n["mcus"]:
+            p = m["programmer"]
+            report.append(f"  PCB{n['nestId']}: {n['shape']['shapeId']}, MCU at ({m['shape']['shapeXCoord']}, "
+                          f"{m['shape']['shapeYCoord']}) programmer {p['programmerId']}/{p['channel']}/{p['slot']}")
+    return shapes, nests, report
+
+
 # ---------- output ----------
 
 def write_json(doc, path):
@@ -459,6 +675,9 @@ def parse_args(argv):
                         help="shape id for a legend name, e.g. 'IO driver=UART'")
     parser.add_argument("--point-name", action="append", default=None, metavar="NAME",
                         help="legend names drawn as a point (default: 'IO driver')")
+    parser.add_argument("--panel", action="store_true",
+                        help="Nutzen.pdf has several equal boards: one nest per board, nest IDs and programmers "
+                             "from the PCB<n> / PROG<id><A|B><slot> labels in the image (OCR)")
     parser.add_argument("--preview", type=Path, default=None, help="default: preview/<Name>.png next to this script")
     args = parser.parse_args(argv)
     args.shape_names = dict(item.split("=", 1) for item in args.shape_name)
@@ -484,32 +703,20 @@ def main(argv=None):
     warnings = []
     frame_poly = frame_polygon(gray, lines, warnings)
 
-    board, chips, legends, words, notes = read_pdf(pdf_path)
-    warnings.extend(notes)
-    points = outline_points(board)
-    origin_pdf = np.concatenate(segments(board)).min(axis=0)
-    scale, offset = coarse_fit(lines, points, bounding_box(frame_poly))
-    scale, offset, error = refine_fit(lines, points, scale, offset)
-
-    def to_image(pt):
-        return tuple((np.array(pt) - origin_pdf) * scale + offset)
-
-    if error > 3.0:
-        warnings.append(f"Board outline fits the image poorly (mean distance {error:.1f} px), check the preview")
-    nest = nest_polygon(board, origin_pdf, scale, offset, gray.shape)
-    mcu_shapes, mcus = build_mcus(chips, legends, words, to_image, origin, args, warnings)
-
-    def relative(poly):
-        return [(x - origin[0], y - origin[1]) for x, y in poly]
+    if args.panel:
+        shapes, nests, report = build_panel(folder, pdf_path, gray, lines, bounding_box(frame_poly),
+                                            origin, args, warnings)
+    else:
+        shapes, nests, report = build_single(pdf_path, gray, lines, frame_poly, origin, args, warnings)
 
     doc = {
         "fixtureId": fixture,
         "image": f"fixtures/resources/{image_path.name}",
         "imagetype": "gray",
         "shape": placement("ShapeModel", *frame_poly[0]),
-        "shapes": [shape_entry("ShapeModel", relative(frame_poly)), shape_entry("NestShape", relative(nest))]
-                  + [shape_entry(sid, coords) for sid, coords in mcu_shapes.items()],
-        "nests": [{"nestId": 1, "shape": placement("NestShape", *nest[0]), "mcus": mcus}],
+        "shapes": [shape_entry("ShapeModel", [(x - origin[0], y - origin[1]) for x, y in frame_poly])]
+                  + [shape_entry(sid, coords) for sid, coords in shapes],
+        "nests": nests,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(doc, json_path)
@@ -518,12 +725,8 @@ def main(argv=None):
 
     print(f"PDF:      {pdf_path.name}")
     print(f"Image:    {image_path}{' (created)' if created else ''}")
-    print(f"Fit:      scale {scale:.4f} px/pt, offset ({offset[0]:.1f}, {offset[1]:.1f}), mean error {error:.2f} px")
-    print(f"Nest:     {len(nest)} points, MCUs: {len(mcus)}")
-    for mcu in mcus:
-        p = mcu["programmer"]
-        print(f"  MCU {mcu['mcuId']}: {mcu['shape']['shapeId']} at ({mcu['shape']['shapeXCoord']}, "
-              f"{mcu['shape']['shapeYCoord']}) programmer {p['programmerId']}/{p['channel']}/{p['slot']}")
+    for line in report:
+        print(line)
     print(f"JSON:     {json_path}")
     print(f"Preview:  {preview}")
     for warning in warnings:

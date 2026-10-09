@@ -16,7 +16,7 @@ This file contains general rules only. Never store information about specific fi
 | `fixture_gen.py` | Generator: input folder → `<Name>.json`, resource image if missing, preview PNG |
 | `pdf_inspect.py` | Shows what the generator reads from an MCU position PDF (board path, MCU boxes, legend, references) |
 | `install_requirements.ps1` | Installs `requirements.txt` into the user's Python (3.10+) and checks the imports |
-| `requirements.txt` | numpy, opencv-python-headless, pymupdf (pinned) |
+| `requirements.txt` | numpy, opencv-python, pymupdf, rapidocr-onnxruntime (pinned) |
 
 Setup: `powershell -ExecutionPolicy Bypass -File .\install_requirements.ps1`
 
@@ -30,7 +30,7 @@ The fixture data is not in this repo. The user names the input folder and the ou
 | `Nutzen_CNT.jpg` | Contour line drawing (gray/black lines on white) of the PCB in its nest, with labels PCB1, PROGxx, B5/B7, DMC. Usually no frame. The board can touch the image border. |
 | `MCU_Pos.pdf` | Valeo PCB assembly drawing (vector). MCUs are filled boxes in color. Optional legend next to the board: colored box + text, see Legend below. |
 | `MCU_Pos_ADJUSTED.pdf` | Optional. Corrected version of MCU_Pos.pdf and wins over it. Corrections are red strike-throughs of legend text, new legend text, and red callout notes (e.g. "hier nur punkt (IO driver), kein rechteck" = this MCU is a point, not a rectangle). |
-| `Nutzen.pdf` | Optional outline drawing of the panel (PCB, sometimes connector). Has no MCUs. Not used. |
+| `Nutzen.pdf` | Optional outline drawing of the panel (PCB, sometimes connector). Has no MCUs. Only used in panel mode (several equal boards), see Panel mode below. |
 | other PDFs | MCU position drawings can have other names, e.g. `MCU_Pos_Top.pdf` or `<drawing number>_ASSEMBLY_BOT_<...>.pdf` (bottom-side view). They work the same way. A bottom-side drawing can still have the same orientation as the CNT image; check it. |
 
 If the folder has no `MCU_Pos.pdf` (or `MCU_Pos*ADJUSTED*.pdf`), always ask the user whether one of the
@@ -90,7 +90,7 @@ Values below are placeholders.
 | `shape` | Placement of `ShapeModel` (the fixture frame / panel outline) |
 | `shapes[]` | Shape definitions, each `shapeId` once. Shapes are reused by several placements (e.g. both halves of a dual-programmer MCU). |
 | `borderThickness` | Always 3 |
-| `nests[]` | One nest per PCB. So far always one nest, `nestId` 1. |
+| `nests[]` | One nest per PCB. Single board: one nest, `nestId` 1. Panel mode: one nest per board, sorted by `nestId`. |
 | `nests[].mcus[]` | One entry per programmer connection. `mcuId` 1..n. |
 | `programmer` | From the legend token, see below |
 
@@ -114,7 +114,7 @@ Values below are placeholders.
 | MCU box | Filled colored (non-gray) box inside the PDF board outline. Colored boxes outside the board are legend boxes. |
 | Legend | Colored box with text in the same line. Programmer tokens and MCU type in any order: `PROG2A <type>`, `<type> PROG1A`, `PROG1A / 1B1 <type>`, `P1A <type>`. |
 | Legend match | By exact fill color. A chip's fill can differ from its legend box (e.g. turquoise chip, light-cyan legend). Then the unused legend with the nearest hue is used and a warning is printed. Check that match in the PDF. |
-| MCU name | Legend text minus the programmer tokens. Without a legend: the reference designator inside the box (e.g. `U123`). |
+| MCU name | Legend text minus the programmer tokens. Without a legend: the reference designator inside the box (e.g. `U123`). In panel mode, if the PDF text is drawn as strokes (no PDF words), the reference is read by OCR. |
 | `shapeId` | `MCU_<name>` with spaces → `_`, unless overridden with `--shape-name "<name>=<id>"` (e.g. `"IO driver=UART"`). |
 | Programmer | Token `PROG<id><A/B><slot?>`, `P<id><A/B><slot?>` or short `<id><A/B><slot?>` after a `/`: `programmerId` = id, `channel` A=0 / B=1, `slot` = the digit, 0 if missing (user decision). `PROG1A / 1B1 <type>` = one chip on two programmer channels. |
 | Several programmers on one chip | Box split horizontally into equal parts, left part = first token. |
@@ -137,19 +137,35 @@ then fits scale and offset:
 
 Dark threshold for lines: gray < 160 (JPEG anti-aliasing).
 
+### Panel mode (`--panel`)
+
+Use it when `Nutzen.pdf` shows several equal boards and `Nutzen_CNT.jpg` has a `PCB<n>` and a
+`PROG<id><A|B><slot>` label inside each board.
+
+| Element | Rule |
+|---|---|
+| Boards | The largest group of equal stroked paths in `Nutzen.pdf` (same item count and size). The panel outline (largest stroked path) and all boards are fitted to the image together. |
+| `NestShape` / `NestShape_180` | `NestShape` = orientation of the top-left board, `NestShape_180` = boards turned by 180 degrees (detected by the side of the path centroid). One polygon per orientation, moved to each board. |
+| Board in the MCU PDF | The board outline from `Nutzen.pdf` is fitted onto the rendered MCU PDF as drawn, mirrored left-right, mirrored top-bottom and rotated 180; the best one wins. The summary shows the variant and the share of outline points on lines (warning below 90%). |
+| MCU | Exactly one colored box inside the located board; the generator stops otherwise. Carried into every nest (turned for `NestShape_180`), one shared MCU shape, `mcuId` 1. |
+| `nestId` | Number of the `PCB<n>` label inside the board polygon (OCR on the resource image). A board without exactly one PCB label gets the next free ID and a warning. |
+| Programmer | The `PROG` label inside the board polygon. A board without exactly one PROG label gets no MCU and a warning. Other labels (`U<n> X<k>`, `Single PCB`, B5/B7, DMC) are ignored. |
+
 ## Workflow for a new fixture
 
 1. `python pdf_inspect.py "<input folder>/<MCU PDF>"`. Check: one board outline with an aspect ratio
    like the PCB in the CNT image, one colored box per MCU, legend parsed correctly, notes about hue matches.
+   If the board outline is the page frame, the PDF has no single closed board path; this only works in panel mode.
 2. Read the PDF and `Nutzen_CNT.jpg` yourself (Read tool) for notes and callouts the parser doesn't
    understand (points instead of rectangles, renamed MCUs, changed programmer channels). Compare a
    mounting hole in both to make sure the drawing is not mirrored or rotated.
 3. Ask the user in one round for everything open: name, fixture ID (missing or range), which PDF if
    there is no `MCU_Pos.pdf`, and anything not covered by the rules above.
-4. `python fixture_gen.py "<input folder>" --name <Name> [--fixture-id <n>] [--pdf <file>] [--shape-name "NAME=ID"] [--point-name "NAME"] [--scale <f>] [--out-dir <dir>]`.
+4. `python fixture_gen.py "<input folder>" --name <Name> [--panel] [--fixture-id <n>] [--pdf <file>] [--shape-name "NAME=ID"] [--point-name "NAME"] [--scale <f>] [--out-dir <dir>]`.
    It refuses to overwrite an existing JSON; use `--force` only with the user's OK.
 5. Look at the preview `preview/<Name>.png` (blue = ShapeModel, red = NestShape, green = MCUs; points
    drawn as dots). The red outline must lie on the PCB contour and green boxes where the colored chips are in the PDF.
+   In panel mode also check the summary: number of nests, PCB numbers, programmer per PCB and the MCU name.
 6. After runs or question rounds that produced new findings (rules, user decisions, new input
    variants, pitfalls), always ask the user whether to add them to this CLAUDE.md.
    Show the proposed text and add it only after the user agrees. Write findings as general rules,
@@ -178,5 +194,15 @@ Dark threshold for lines: gray < 160 (JPEG anti-aliasing).
   have 200+ points. That's expected.
 - Watermark text in the PDFs (e.g. "Prototype Released" in yellow over the board) is not picked up as an MCU box.
   Only filled colored boxes count.
-- Not every drawing must be in the same orientation as the CNT image. The generator doesn't handle
-  mirrored or rotated drawings.
+- Not every drawing must be in the same orientation as the CNT image. An MCU PDF can show the board
+  mirrored (top view) compared with the CNT image. Panel mode finds the orientation itself; the single-board
+  mode doesn't handle mirrored or rotated drawings.
+- Text in a PDF can be drawn as strokes: `get_text("words")` is empty, so there are no legends and no
+  references. OCR confuses O and 0 depending on the resolution (`M0D1`); the generator renders the chip at
+  several resolutions and keeps the most confident match.
+- Without a single closed board path in the MCU PDF, `board_drawing` picks the page frame as the board.
+  Single-board mode then takes every colored box as an MCU; panel mode locates the board by fitting instead.
+- Set `PYTHONIOENCODING=utf-8` when printing OCR results in a console with code page 1252.
+- `opencv-python` and `opencv-python-headless` share the `cv2` folder. Keep only `opencv-python` (needed by
+  rapidocr). `install_requirements.ps1` removes headless and reinstalls `opencv-python`.
+- OCR on the full resource image takes a few seconds. It runs on a half-size copy (`OCR_SCALE`).
